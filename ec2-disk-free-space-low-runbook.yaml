@@ -1,0 +1,154 @@
+description: "This document is to be used with the [EC2DiskFreeSpaceLow](https://us-east-2.console.aws.amazon.com/systems-manager/incidents/response-plans/home?region=us-east-2#/view/808085695168/EC2DiskFreeSpaceLow) response plan!"
+schemaVersion: "0.3"
+assumeRole: "arn:aws:iam::808085695168:role/AutomationServiceRole"
+parameters:
+  AlarmArn:
+    type: StringList
+    description: The ARN of the CloudWatch Alarm that invoked this runbook
+mainSteps:
+  - name: GatherAlarmData
+    action: "aws:executeScript"
+    description: |-
+      Gathers additional data about this alarm, including the EC2 instance ID, device, mount path, and filesystem type
+    inputs:
+      Runtime: python3.8
+      Handler: script_handler
+      Script: |-
+        import boto3
+        import json
+
+        def script_handler(event, context):
+            arn = event['alarmArn'][0]
+            # cloudwatch alarm name from arn
+            name = arn.split(':')[6]
+            cloudwatch = boto3.resource('cloudwatch')
+            alarm = cloudwatch.Alarm(name)
+            output = {}
+            # get dimensions from this alarm
+            for d in alarm.dimensions:
+                if d['Name'] in ['InstanceId', 'device', 'path', 'fstype']:
+                    output[d['Name']] = d['Value']
+            print(f'dimensions from alarm: {output}')
+            
+            # get volume data from this instance
+            ec2 = boto3.client('ec2')
+            volumes = ec2.describe_volumes(
+              Filters=[
+                {
+                  'Name': 'attachment.instance-id',
+                  'Values': [output['InstanceId']]
+                }
+              ]
+            )
+            output['volumes'] = []
+            for volume in volumes['Volumes']:
+              output['volumes'].append(
+                {
+                  'VolumeId': volume['Attachments'][0]['VolumeId']
+                }
+              )
+            return output
+      InputPayload:
+        alarmArn: "{{AlarmArn}}"
+    outputs:
+      - Name: Path
+        Selector: $.Payload.path
+        Type: String
+      - Name: Device
+        Selector: $.Payload.device
+        Type: String
+      - Name: InstanceId
+        Selector: $.Payload.InstanceId
+        Type: String
+      - Name: Volumes
+        Selector: $.Payload.volumes
+        Type: MapList
+  - name: GatherInstanceData
+    action: 'aws:runCommand'
+    description: |-
+      Runs local OS commands on this instance to add context to the alert.
+      **Example Commands**
+
+      ```
+      # Gather block device information
+      for d in `lsblk -o NAME --noheadings -r`; do echo "/dev/$d ->" && sudo ebsnvme-id /dev/$d; done
+      # Show filesystems, mount points, and usage
+      df -h
+      cat /etc/fstab
+      # Various I/O related metrics from all volumes
+      iostat -x
+      ```
+    inputs:
+      DocumentName: AWS-RunShellScript
+      InstanceIds: 
+        - '{{ GatherAlarmData.InstanceId }}'
+      Parameters:
+       commands: |-
+          echo "getting info on block devices..."
+          for d in `lsblk -o NAME --noheadings -r`; do echo "/dev/$d ->" && sudo ebsnvme-id /dev/$d; done
+          echo "df -h:"
+          df -h
+          echo "cat /etc/fstab"
+          cat /etc/fstab
+          echo "iostat -x"
+          iostat -x
+  - name: Triage
+    action: "aws:pause"
+    inputs: {}
+    description: |-
+      **Determine impact**
+
+      * View the **Metrics** tab of the incident or navigate to your [CloudWatch Dashboards](https://console.aws.amazon.com/cloudwatch/home#dashboards:) to find what alarm(s) have triggered. 
+
+      **Communicate impact**
+
+      Update the following fields to accurately describe the incident:
+      * **Title** - The title should be quickly recognizable by the team and specific to the particular incident.
+      * **Summary** - The summary should contain the most important and up-to-date information to quickly onboard new responders to the incident.
+      * **Impact** - Select one of the following impact ratings to describe the incident:
+        * 1 – Critical impact, full application failure that impacts many to all customers.
+        * 2 – High impact, partial application failure with impact to many customers.
+        * 3 – Medium impact, the application is providing reduced service to many customers.
+        * 4 – Low impact, the application is providing reduced service to few customers.
+        * 5 – No impact, customers are not currently impacted but urgent action is needed to avoid impact.
+  - name: Diagnosis
+    action: "aws:pause"
+    inputs: {}
+    description: |
+      **Investigate Volume**
+
+      [Launch a session onto the instance](https://{{global:REGION}}.console.aws.amazon.com/systems-manager/session-manager/{{GatherAlarmData.InstanceId}}?region={{global:REGION}})
+      to get started. Consider looking at the files on the volume and see if anything could potentially be moved / deleted / compressed.
+
+  - name: Mitigation
+    action: "aws:pause"
+    description: |-
+      **Collaborate**  
+      * Engage additional contacts or teams using their escalation plan from the **Contacts** tab.
+      * If necessary, prepare an emergency change request in [Change Manager](https://console.aws.amazon.com/systems-manager/change-manager).
+
+      **Implement mitigation**  
+      * If possible, remove data from the volume to immediately free up space
+      * If removing data is not possible, you can run automation to extend the volume - for example:
+
+      ```aws ssm start-automation-execution --document-name "WF-ResizeLinuxEBSVolume" \
+         --document-version "\$DEFAULT" \
+         --parameters '{"VolumeId":["vol-00c4327c64d95b585"],"BlockDevice":["/dev/xvdb"],"MountPoint":["/tmp"],"SizeInGB":["15"],"AutomationAssumeRole":[""]}' --region {{global:REGION}}
+      ```
+
+      * Otherwise, using the values from the previous step, execute [WF-ResizeLinuxEBSVolume](https://us-east-2.console.aws.amazon.com/systems-manager/documents/WF-ResizeLinuxEBSVolume/) automation
+      * This will snapshot the volume, resize it, and extend the file system
+
+      * Update the **Timeline** tab of the incident when a possible mitigation is identified. If needed, review the mitigation with others in the associated chat channel before proceeding.
+    inputs: {}
+  - name: Recovery
+    action: "aws:pause"
+    inputs: {}
+    description: |-
+      **Monitor customer impact**
+      * View the **Metrics** tab of the incident to monitor for recovery of your key performance indicators (KPIs).
+      * Update the **Impact** field in the incident when impact has been reduced or resolved. 
+
+      **Identify action items**  
+      * Add entries in the **Timeline** tab of the incident to record key decisions and actions taken, including temporary mitigations that might have been implemented. 
+      * Create a **Post-Incident Analysis** when the incident is closed in order to identify and track action items in [OpsCenter](https://console.aws.amazon.com/systems-manager/opsitems).
